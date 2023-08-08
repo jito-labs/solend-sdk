@@ -1,9 +1,14 @@
 //! Instruction types
 
+use crate::state::{LendingMarketMetadata, ReserveType};
 use crate::{
     error::LendingError,
     state::{RateLimiterConfig, ReserveConfig, ReserveFees},
 };
+use bytemuck::bytes_of;
+
+use num_traits::FromPrimitive;
+use solana_program::system_program;
 use solana_program::{
     instruction::{AccountMeta, Instruction},
     msg,
@@ -15,6 +20,7 @@ use std::{convert::TryInto, mem::size_of};
 
 /// Instructions supported by the lending program.
 #[derive(Clone, Debug, PartialEq, Eq)]
+// #[allow(clippy::large_enum_variant)]
 pub enum LendingInstruction {
     // 0
     /// Initializes a new lending market.
@@ -48,6 +54,8 @@ pub enum LendingInstruction {
         rate_limiter_config: RateLimiterConfig,
         /// whitelist liquidator
         whitelisted_liquidator: Option<Pubkey>,
+        /// The risk authority
+        risk_authority: Pubkey,
     },
 
     // 2
@@ -444,7 +452,7 @@ pub enum LendingInstruction {
         liquidity_amount: u64,
     },
 
-    // 18
+    // 20
     /// Flash repay reserve liquidity
     //
     /// Accounts expected by this instruction:
@@ -466,6 +474,30 @@ pub enum LendingInstruction {
         /// Index of FlashBorrowReserveLiquidity instruction
         borrow_instruction_index: u8,
     },
+
+    // 21
+    /// Forgive Debt
+    ///
+    /// Accounts expected by this instruction:
+    ///  0. `[writable]` Obligation account - refreshed.
+    ///  1. `[writable]` Reserve account - refreshed.
+    ///  2. `[]` Lending Market account.
+    ///  3. `[signer]` Lending Market owner.
+    ForgiveDebt {
+        /// Amount of debt to forgive
+        liquidity_amount: u64,
+    },
+
+    // 22
+    /// UpdateMarketMetadata
+    ///
+    /// Accounts expected by this instruction:
+    /// 0. `[]` Lending market account.
+    /// 1. `[signer]` Lending market owner.
+    /// 2. `[writable]` Lending market metadata account.
+    /// Must be a pda with seeds [lending_market, "MetaData"]
+    /// 3. `[]` System program
+    UpdateMarketMetadata,
 }
 
 impl LendingInstruction {
@@ -487,7 +519,7 @@ impl LendingInstruction {
                 let (new_owner, rest) = Self::unpack_pubkey(rest)?;
                 let (window_duration, rest) = Self::unpack_u64(rest)?;
                 let (max_outflow, rest) = Self::unpack_u64(rest)?;
-                let (whitelisted_liquidator, _rest) = match Self::unpack_u8(rest)? {
+                let (whitelisted_liquidator, rest) = match Self::unpack_u8(rest)? {
                     (0, rest) => (None, rest),
                     (1, rest) => {
                         let (pubkey, rest) = Self::unpack_pubkey(rest)?;
@@ -496,6 +528,7 @@ impl LendingInstruction {
                     _ => return Err(LendingError::InstructionUnpackError.into()),
                 };
 
+                let (risk_authority, _rest) = Self::unpack_pubkey(rest)?;
                 Self::SetLendingMarketOwnerAndConfig {
                     new_owner,
                     rate_limiter_config: RateLimiterConfig {
@@ -503,17 +536,20 @@ impl LendingInstruction {
                         max_outflow,
                     },
                     whitelisted_liquidator,
+                    risk_authority,
                 }
             }
             2 => {
                 let (liquidity_amount, rest) = Self::unpack_u64(rest)?;
                 let (optimal_utilization_rate, rest) = Self::unpack_u8(rest)?;
+                let (max_utilization_rate, rest) = Self::unpack_u8(rest)?;
                 let (loan_to_value_ratio, rest) = Self::unpack_u8(rest)?;
                 let (liquidation_bonus, rest) = Self::unpack_u8(rest)?;
                 let (liquidation_threshold, rest) = Self::unpack_u8(rest)?;
                 let (min_borrow_rate, rest) = Self::unpack_u8(rest)?;
                 let (optimal_borrow_rate, rest) = Self::unpack_u8(rest)?;
                 let (max_borrow_rate, rest) = Self::unpack_u8(rest)?;
+                let (super_max_borrow_rate, rest) = Self::unpack_u64(rest)?;
                 let (borrow_fee_wad, rest) = Self::unpack_u64(rest)?;
                 let (flash_loan_fee_wad, rest) = Self::unpack_u64(rest)?;
                 let (host_fee_percentage, rest) = Self::unpack_u8(rest)?;
@@ -522,17 +558,24 @@ impl LendingInstruction {
                 let (fee_receiver, rest) = Self::unpack_pubkey(rest)?;
                 let (protocol_liquidation_fee, rest) = Self::unpack_u8(rest)?;
                 let (protocol_take_rate, rest) = Self::unpack_u8(rest)?;
-                let (added_borrow_weight_bps, _rest) = Self::unpack_u64(rest)?;
+                let (added_borrow_weight_bps, rest) = Self::unpack_u64(rest)?;
+                let (asset_type, rest) = Self::unpack_u8(rest)?;
+                let (max_liquidation_bonus, rest) = Self::unpack_u8(rest)?;
+                let (max_liquidation_threshold, _rest) = Self::unpack_u8(rest)?;
                 Self::InitReserve {
                     liquidity_amount,
                     config: ReserveConfig {
                         optimal_utilization_rate,
+                        max_utilization_rate,
                         loan_to_value_ratio,
                         liquidation_bonus,
+                        max_liquidation_bonus,
                         liquidation_threshold,
+                        max_liquidation_threshold,
                         min_borrow_rate,
                         optimal_borrow_rate,
                         max_borrow_rate,
+                        super_max_borrow_rate,
                         fees: ReserveFees {
                             borrow_fee_wad,
                             flash_loan_fee_wad,
@@ -544,6 +587,7 @@ impl LendingInstruction {
                         protocol_liquidation_fee,
                         protocol_take_rate,
                         added_borrow_weight_bps,
+                        reserve_type: ReserveType::from_u8(asset_type).unwrap(),
                     },
                 }
             }
@@ -592,12 +636,14 @@ impl LendingInstruction {
             }
             16 => {
                 let (optimal_utilization_rate, rest) = Self::unpack_u8(rest)?;
+                let (max_utilization_rate, rest) = Self::unpack_u8(rest)?;
                 let (loan_to_value_ratio, rest) = Self::unpack_u8(rest)?;
                 let (liquidation_bonus, rest) = Self::unpack_u8(rest)?;
                 let (liquidation_threshold, rest) = Self::unpack_u8(rest)?;
                 let (min_borrow_rate, rest) = Self::unpack_u8(rest)?;
                 let (optimal_borrow_rate, rest) = Self::unpack_u8(rest)?;
                 let (max_borrow_rate, rest) = Self::unpack_u8(rest)?;
+                let (super_max_borrow_rate, rest) = Self::unpack_u64(rest)?;
                 let (borrow_fee_wad, rest) = Self::unpack_u64(rest)?;
                 let (flash_loan_fee_wad, rest) = Self::unpack_u64(rest)?;
                 let (host_fee_percentage, rest) = Self::unpack_u8(rest)?;
@@ -607,18 +653,25 @@ impl LendingInstruction {
                 let (protocol_liquidation_fee, rest) = Self::unpack_u8(rest)?;
                 let (protocol_take_rate, rest) = Self::unpack_u8(rest)?;
                 let (added_borrow_weight_bps, rest) = Self::unpack_u64(rest)?;
+                let (asset_type, rest) = Self::unpack_u8(rest)?;
+                let (max_liquidation_bonus, rest) = Self::unpack_u8(rest)?;
+                let (max_liquidation_threshold, rest) = Self::unpack_u8(rest)?;
                 let (window_duration, rest) = Self::unpack_u64(rest)?;
                 let (max_outflow, _rest) = Self::unpack_u64(rest)?;
 
                 Self::UpdateReserveConfig {
                     config: ReserveConfig {
                         optimal_utilization_rate,
+                        max_utilization_rate,
                         loan_to_value_ratio,
                         liquidation_bonus,
+                        max_liquidation_bonus,
                         liquidation_threshold,
+                        max_liquidation_threshold,
                         min_borrow_rate,
                         optimal_borrow_rate,
                         max_borrow_rate,
+                        super_max_borrow_rate,
                         fees: ReserveFees {
                             borrow_fee_wad,
                             flash_loan_fee_wad,
@@ -630,6 +683,7 @@ impl LendingInstruction {
                         protocol_liquidation_fee,
                         protocol_take_rate,
                         added_borrow_weight_bps,
+                        reserve_type: ReserveType::from_u8(asset_type).unwrap(),
                     },
                     rate_limiter_config: RateLimiterConfig {
                         window_duration,
@@ -654,6 +708,11 @@ impl LendingInstruction {
                     borrow_instruction_index,
                 }
             }
+            21 => {
+                let (liquidity_amount, _rest) = Self::unpack_u64(rest)?;
+                Self::ForgiveDebt { liquidity_amount }
+            }
+            22 => Self::UpdateMarketMetadata,
             _ => {
                 msg!("Instruction cannot be unpacked");
                 return Err(LendingError::InstructionUnpackError.into());
@@ -729,12 +788,12 @@ impl LendingInstruction {
                 new_owner,
                 rate_limiter_config: config,
                 whitelisted_liquidator,
+                risk_authority,
             } => {
                 buf.push(1);
                 buf.extend_from_slice(new_owner.as_ref());
                 buf.extend_from_slice(&config.window_duration.to_le_bytes());
                 buf.extend_from_slice(&config.max_outflow.to_le_bytes());
-
                 match whitelisted_liquidator {
                     Some(liquidator) => {
                         buf.push(1);
@@ -744,18 +803,23 @@ impl LendingInstruction {
                         buf.push(0);
                     }
                 };
+                buf.extend_from_slice(risk_authority.as_ref());
             }
             Self::InitReserve {
                 liquidity_amount,
                 config:
                     ReserveConfig {
                         optimal_utilization_rate,
+                        max_utilization_rate,
                         loan_to_value_ratio,
                         liquidation_bonus,
+                        max_liquidation_bonus,
                         liquidation_threshold,
+                        max_liquidation_threshold,
                         min_borrow_rate,
                         optimal_borrow_rate,
                         max_borrow_rate,
+                        super_max_borrow_rate,
                         fees:
                             ReserveFees {
                                 borrow_fee_wad,
@@ -768,17 +832,20 @@ impl LendingInstruction {
                         protocol_liquidation_fee,
                         protocol_take_rate,
                         added_borrow_weight_bps: borrow_weight_bps,
+                        reserve_type: asset_type,
                     },
             } => {
                 buf.push(2);
                 buf.extend_from_slice(&liquidity_amount.to_le_bytes());
                 buf.extend_from_slice(&optimal_utilization_rate.to_le_bytes());
+                buf.extend_from_slice(&max_utilization_rate.to_le_bytes());
                 buf.extend_from_slice(&loan_to_value_ratio.to_le_bytes());
                 buf.extend_from_slice(&liquidation_bonus.to_le_bytes());
                 buf.extend_from_slice(&liquidation_threshold.to_le_bytes());
                 buf.extend_from_slice(&min_borrow_rate.to_le_bytes());
                 buf.extend_from_slice(&optimal_borrow_rate.to_le_bytes());
                 buf.extend_from_slice(&max_borrow_rate.to_le_bytes());
+                buf.extend_from_slice(&super_max_borrow_rate.to_le_bytes());
                 buf.extend_from_slice(&borrow_fee_wad.to_le_bytes());
                 buf.extend_from_slice(&flash_loan_fee_wad.to_le_bytes());
                 buf.extend_from_slice(&host_fee_percentage.to_le_bytes());
@@ -788,6 +855,9 @@ impl LendingInstruction {
                 buf.extend_from_slice(&protocol_liquidation_fee.to_le_bytes());
                 buf.extend_from_slice(&protocol_take_rate.to_le_bytes());
                 buf.extend_from_slice(&borrow_weight_bps.to_le_bytes());
+                buf.extend_from_slice(&(asset_type as u8).to_le_bytes());
+                buf.extend_from_slice(&max_liquidation_bonus.to_le_bytes());
+                buf.extend_from_slice(&max_liquidation_threshold.to_le_bytes());
             }
             Self::RefreshReserve => {
                 buf.push(3);
@@ -844,12 +914,14 @@ impl LendingInstruction {
             } => {
                 buf.push(16);
                 buf.extend_from_slice(&config.optimal_utilization_rate.to_le_bytes());
+                buf.extend_from_slice(&config.max_utilization_rate.to_le_bytes());
                 buf.extend_from_slice(&config.loan_to_value_ratio.to_le_bytes());
                 buf.extend_from_slice(&config.liquidation_bonus.to_le_bytes());
                 buf.extend_from_slice(&config.liquidation_threshold.to_le_bytes());
                 buf.extend_from_slice(&config.min_borrow_rate.to_le_bytes());
                 buf.extend_from_slice(&config.optimal_borrow_rate.to_le_bytes());
                 buf.extend_from_slice(&config.max_borrow_rate.to_le_bytes());
+                buf.extend_from_slice(&config.super_max_borrow_rate.to_le_bytes());
                 buf.extend_from_slice(&config.fees.borrow_fee_wad.to_le_bytes());
                 buf.extend_from_slice(&config.fees.flash_loan_fee_wad.to_le_bytes());
                 buf.extend_from_slice(&config.fees.host_fee_percentage.to_le_bytes());
@@ -859,6 +931,9 @@ impl LendingInstruction {
                 buf.extend_from_slice(&config.protocol_liquidation_fee.to_le_bytes());
                 buf.extend_from_slice(&config.protocol_take_rate.to_le_bytes());
                 buf.extend_from_slice(&config.added_borrow_weight_bps.to_le_bytes());
+                buf.extend_from_slice(&(config.reserve_type as u8).to_le_bytes());
+                buf.extend_from_slice(&config.max_liquidation_bonus.to_le_bytes());
+                buf.extend_from_slice(&config.max_liquidation_threshold.to_le_bytes());
                 buf.extend_from_slice(&rate_limiter_config.window_duration.to_le_bytes());
                 buf.extend_from_slice(&rate_limiter_config.max_outflow.to_le_bytes());
             }
@@ -881,6 +956,12 @@ impl LendingInstruction {
                 buf.extend_from_slice(&liquidity_amount.to_le_bytes());
                 buf.extend_from_slice(&borrow_instruction_index.to_le_bytes());
             }
+            Self::ForgiveDebt { liquidity_amount } => {
+                buf.push(21);
+                buf.extend_from_slice(&liquidity_amount.to_le_bytes());
+            }
+            // special handling for this instruction, bc the instruction is too big to deserialize
+            Self::UpdateMarketMetadata => {}
         }
         buf
     }
@@ -920,6 +1001,7 @@ pub fn set_lending_market_owner_and_config(
     new_owner: Pubkey,
     rate_limiter_config: RateLimiterConfig,
     whitelisted_liquidator: Option<Pubkey>,
+    risk_authority: Pubkey,
 ) -> Instruction {
     Instruction {
         program_id,
@@ -931,6 +1013,7 @@ pub fn set_lending_market_owner_and_config(
             new_owner,
             rate_limiter_config,
             whitelisted_liquidator,
+            risk_authority,
         }
         .pack(),
     }
@@ -1548,5 +1631,358 @@ pub fn flash_repay_reserve_liquidity(
             borrow_instruction_index,
         }
         .pack(),
+    }
+}
+
+/// Creates a `ForgiveDebt` instruction
+pub fn forgive_debt(
+    program_id: Pubkey,
+    liquidity_amount: u64,
+    reserve_pubkey: Pubkey,
+    obligation_pubkey: Pubkey,
+    lending_market_pubkey: Pubkey,
+    lending_market_owner: Pubkey,
+) -> Instruction {
+    Instruction {
+        program_id,
+        accounts: vec![
+            AccountMeta::new(obligation_pubkey, false),
+            AccountMeta::new(reserve_pubkey, false),
+            AccountMeta::new_readonly(lending_market_pubkey, false),
+            AccountMeta::new_readonly(lending_market_owner, true),
+        ],
+        data: LendingInstruction::ForgiveDebt { liquidity_amount }.pack(),
+    }
+}
+
+/// Creates a `UpdateMarketMetadata` instruction
+pub fn update_market_metadata(
+    program_id: Pubkey,
+    mut metadata: LendingMarketMetadata,
+    lending_market_pubkey: Pubkey,
+    lending_market_owner: Pubkey,
+) -> Instruction {
+    let (lending_market_metadata_pubkey, bump_seed) = Pubkey::find_program_address(
+        &[
+            &lending_market_pubkey.to_bytes()[..PUBKEY_BYTES],
+            b"MetaData",
+        ],
+        &program_id,
+    );
+
+    metadata.bump_seed = bump_seed;
+
+    let mut data = [0u8; 1 + std::mem::size_of::<LendingMarketMetadata>()];
+    data[0] = 22;
+    data[1..].copy_from_slice(bytes_of(&metadata));
+
+    Instruction {
+        program_id,
+        accounts: vec![
+            AccountMeta::new_readonly(lending_market_pubkey, false),
+            AccountMeta::new(lending_market_owner, true),
+            AccountMeta::new(lending_market_metadata_pubkey, false),
+            AccountMeta::new_readonly(system_program::id(), false),
+        ],
+        data: data.to_vec(),
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use rand::Rng;
+
+    #[test]
+    fn pack_and_unpack_instructions() {
+        let mut rng = rand::thread_rng();
+
+        for _ in 0..100 {
+            {
+                let instruction = LendingInstruction::InitLendingMarket {
+                    owner: Pubkey::new_unique(),
+                    quote_currency: [rng.gen::<u8>(); 32],
+                };
+
+                let packed = instruction.pack();
+                let unpacked = LendingInstruction::unpack(&packed).unwrap();
+                assert_eq!(instruction, unpacked);
+            }
+
+            // set lending market owner and config
+            {
+                let instruction = LendingInstruction::SetLendingMarketOwnerAndConfig {
+                    new_owner: Pubkey::new_unique(),
+                    rate_limiter_config: RateLimiterConfig {
+                        window_duration: rng.gen::<u64>(),
+                        max_outflow: rng.gen::<u64>(),
+                    },
+                    whitelisted_liquidator: if rng.gen_bool(0.5) {
+                        None
+                    } else {
+                        Some(Pubkey::new_unique())
+                    },
+                    risk_authority: Pubkey::new_unique(),
+                };
+
+                let packed = instruction.pack();
+                let unpacked = LendingInstruction::unpack(&packed).unwrap();
+                assert_eq!(instruction, unpacked);
+            }
+
+            {
+                let instruction = LendingInstruction::InitReserve {
+                    liquidity_amount: rng.gen::<u64>(),
+                    config: ReserveConfig {
+                        optimal_utilization_rate: rng.gen::<u8>(),
+                        max_utilization_rate: rng.gen::<u8>(),
+                        loan_to_value_ratio: rng.gen::<u8>(),
+                        liquidation_bonus: rng.gen::<u8>(),
+                        max_liquidation_bonus: rng.gen::<u8>(),
+                        liquidation_threshold: rng.gen::<u8>(),
+                        max_liquidation_threshold: rng.gen::<u8>(),
+                        min_borrow_rate: rng.gen::<u8>(),
+                        optimal_borrow_rate: rng.gen::<u8>(),
+                        max_borrow_rate: rng.gen::<u8>(),
+                        super_max_borrow_rate: rng.gen::<u64>(),
+                        fees: ReserveFees {
+                            borrow_fee_wad: rng.gen::<u64>(),
+                            flash_loan_fee_wad: rng.gen::<u64>(),
+                            host_fee_percentage: rng.gen::<u8>(),
+                        },
+                        deposit_limit: rng.gen::<u64>(),
+                        borrow_limit: rng.gen::<u64>(),
+                        fee_receiver: Pubkey::new_unique(),
+                        protocol_liquidation_fee: rng.gen::<u8>(),
+                        protocol_take_rate: rng.gen::<u8>(),
+                        added_borrow_weight_bps: rng.gen::<u64>(),
+                        reserve_type: ReserveType::from_u8(rng.gen::<u8>() % 2).unwrap(),
+                    },
+                };
+
+                let packed = instruction.pack();
+                let unpacked = LendingInstruction::unpack(&packed).unwrap();
+                assert_eq!(instruction, unpacked);
+            }
+
+            // refresh reserve
+            {
+                let instruction = LendingInstruction::RefreshReserve;
+                let packed = instruction.pack();
+                let unpacked = LendingInstruction::unpack(&packed).unwrap();
+                assert_eq!(instruction, unpacked);
+            }
+
+            // deposit reserve liquidity
+            {
+                let instruction = LendingInstruction::DepositReserveLiquidity {
+                    liquidity_amount: rng.gen::<u64>(),
+                };
+
+                let packed = instruction.pack();
+                let unpacked = LendingInstruction::unpack(&packed).unwrap();
+                assert_eq!(instruction, unpacked);
+            }
+
+            // redeem reserve collateral
+            {
+                let instruction = LendingInstruction::RedeemReserveCollateral {
+                    collateral_amount: rng.gen::<u64>(),
+                };
+
+                let packed = instruction.pack();
+                let unpacked = LendingInstruction::unpack(&packed).unwrap();
+                assert_eq!(instruction, unpacked);
+            }
+
+            // init obligation
+            {
+                let instruction = LendingInstruction::InitObligation;
+                let packed = instruction.pack();
+                let unpacked = LendingInstruction::unpack(&packed).unwrap();
+                assert_eq!(instruction, unpacked);
+            }
+
+            // refresh obligation
+            {
+                let instruction = LendingInstruction::RefreshObligation;
+                let packed = instruction.pack();
+                let unpacked = LendingInstruction::unpack(&packed).unwrap();
+                assert_eq!(instruction, unpacked);
+            }
+
+            // deposit obligation collateral
+            {
+                let instruction = LendingInstruction::DepositObligationCollateral {
+                    collateral_amount: rng.gen::<u64>(),
+                };
+
+                let packed = instruction.pack();
+                let unpacked = LendingInstruction::unpack(&packed).unwrap();
+                assert_eq!(instruction, unpacked);
+            }
+
+            // borrow obligation liquidity
+            {
+                let instruction = LendingInstruction::BorrowObligationLiquidity {
+                    liquidity_amount: rng.gen::<u64>(),
+                };
+
+                let packed = instruction.pack();
+                let unpacked = LendingInstruction::unpack(&packed).unwrap();
+                assert_eq!(instruction, unpacked);
+            }
+
+            // repay obligation liquidity
+            {
+                let instruction = LendingInstruction::RepayObligationLiquidity {
+                    liquidity_amount: rng.gen::<u64>(),
+                };
+
+                let packed = instruction.pack();
+                let unpacked = LendingInstruction::unpack(&packed).unwrap();
+                assert_eq!(instruction, unpacked);
+            }
+
+            // liquidate obligation
+            {
+                let instruction = LendingInstruction::LiquidateObligation {
+                    liquidity_amount: rng.gen::<u64>(),
+                };
+
+                let packed = instruction.pack();
+                let unpacked = LendingInstruction::unpack(&packed).unwrap();
+                assert_eq!(instruction, unpacked);
+            }
+
+            // flash loan
+            {
+                let instruction = LendingInstruction::FlashLoan {
+                    amount: rng.gen::<u64>(),
+                };
+
+                let packed = instruction.pack();
+                let unpacked = LendingInstruction::unpack(&packed).unwrap();
+                assert_eq!(instruction, unpacked);
+            }
+
+            // deposit reserve liquidity and obligation collateral
+            {
+                let instruction =
+                    LendingInstruction::DepositReserveLiquidityAndObligationCollateral {
+                        liquidity_amount: rng.gen::<u64>(),
+                    };
+
+                let packed = instruction.pack();
+                let unpacked = LendingInstruction::unpack(&packed).unwrap();
+                assert_eq!(instruction, unpacked);
+            }
+
+            // withdraw obligation collateral and redeem reserve collateral
+            {
+                let instruction =
+                    LendingInstruction::WithdrawObligationCollateralAndRedeemReserveCollateral {
+                        collateral_amount: rng.gen::<u64>(),
+                    };
+
+                let packed = instruction.pack();
+                let unpacked = LendingInstruction::unpack(&packed).unwrap();
+                assert_eq!(instruction, unpacked);
+            }
+
+            // update reserve config
+            {
+                let instruction = LendingInstruction::UpdateReserveConfig {
+                    config: ReserveConfig {
+                        optimal_utilization_rate: rng.gen::<u8>(),
+                        max_utilization_rate: rng.gen::<u8>(),
+                        loan_to_value_ratio: rng.gen::<u8>(),
+                        liquidation_bonus: rng.gen::<u8>(),
+                        max_liquidation_bonus: rng.gen::<u8>(),
+                        liquidation_threshold: rng.gen::<u8>(),
+                        max_liquidation_threshold: rng.gen::<u8>(),
+                        min_borrow_rate: rng.gen::<u8>(),
+                        optimal_borrow_rate: rng.gen::<u8>(),
+                        max_borrow_rate: rng.gen::<u8>(),
+                        super_max_borrow_rate: rng.gen::<u64>(),
+                        fees: ReserveFees {
+                            borrow_fee_wad: rng.gen::<u64>(),
+                            flash_loan_fee_wad: rng.gen::<u64>(),
+                            host_fee_percentage: rng.gen::<u8>(),
+                        },
+                        deposit_limit: rng.gen::<u64>(),
+                        borrow_limit: rng.gen::<u64>(),
+                        fee_receiver: Pubkey::new_unique(),
+                        protocol_liquidation_fee: rng.gen::<u8>(),
+                        protocol_take_rate: rng.gen::<u8>(),
+                        added_borrow_weight_bps: rng.gen::<u64>(),
+                        reserve_type: ReserveType::from_u8(rng.gen::<u8>() % 2).unwrap(),
+                    },
+                    rate_limiter_config: RateLimiterConfig {
+                        window_duration: rng.gen::<u64>(),
+                        max_outflow: rng.gen::<u64>(),
+                    },
+                };
+
+                let packed = instruction.pack();
+                let unpacked = LendingInstruction::unpack(&packed).unwrap();
+                assert_eq!(instruction, unpacked);
+            }
+
+            // liquidate obligation and redeem reserve collateral
+            {
+                let instruction =
+                    LendingInstruction::LiquidateObligationAndRedeemReserveCollateral {
+                        liquidity_amount: rng.gen::<u64>(),
+                    };
+
+                let packed = instruction.pack();
+                let unpacked = LendingInstruction::unpack(&packed).unwrap();
+                assert_eq!(instruction, unpacked);
+            }
+
+            // redeem fees
+            {
+                let instruction = LendingInstruction::RedeemFees;
+
+                let packed = instruction.pack();
+                let unpacked = LendingInstruction::unpack(&packed).unwrap();
+                assert_eq!(instruction, unpacked);
+            }
+
+            // flash borrow reserve liquidity
+            {
+                let instruction = LendingInstruction::FlashBorrowReserveLiquidity {
+                    liquidity_amount: rng.gen::<u64>(),
+                };
+
+                let packed = instruction.pack();
+                let unpacked = LendingInstruction::unpack(&packed).unwrap();
+                assert_eq!(instruction, unpacked);
+            }
+
+            // flash repay reserve liquidity
+            {
+                let instruction = LendingInstruction::FlashRepayReserveLiquidity {
+                    liquidity_amount: rng.gen::<u64>(),
+                    borrow_instruction_index: rng.gen::<u8>(),
+                };
+
+                let packed = instruction.pack();
+                let unpacked = LendingInstruction::unpack(&packed).unwrap();
+                assert_eq!(instruction, unpacked);
+            }
+
+            // forgive debt
+            {
+                let instruction = LendingInstruction::ForgiveDebt {
+                    liquidity_amount: rng.gen::<u64>(),
+                };
+
+                let packed = instruction.pack();
+                let unpacked = LendingInstruction::unpack(&packed).unwrap();
+                assert_eq!(instruction, unpacked);
+            }
+        }
     }
 }

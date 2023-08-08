@@ -6,7 +6,7 @@ homepage = "https://solend.fi"
 license = "Apache-2.0"
 name = "solend-program-cli"
 repository = "https://github.com/solendprotocol/solana-program-library"
-version = "0.1.0"
+version = "2.0.2"
 
 [dependencies]
 clap = "=2.34.0"
@@ -20,6 +20,7 @@ solend-sdk = { path="../sdk" }
 solend-program = { path="../program", features = [ "no-entrypoint" ] }
 spl-token = { version = "3.3.0", features=["no-entrypoint"] }
 spl-associated-token-account = "1.0"
+solana-account-decoder = "1.14.10"
 
 [[bin]]
 name = "solend-program"

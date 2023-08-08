@@ -110,7 +110,7 @@ async fn setup() -> (
             &wsol_reserve,
             &obligation,
             &user,
-            &lending_market_owner.get_account(&wsol_mint::id()).unwrap(),
+            lending_market_owner.get_account(&wsol_mint::id()),
             u64::MAX,
         )
         .await
@@ -227,7 +227,7 @@ async fn test_fail_pyth_price_stale() {
     assert_eq!(
         res,
         TransactionError::InstructionError(
-            0,
+            1,
             InstructionError::Custom(LendingError::NullOracleConfig as u32),
         ),
     );

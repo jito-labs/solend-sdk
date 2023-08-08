@@ -4,15 +4,16 @@ use crate::{
     self as solend_program,
     error::LendingError,
     instruction::LendingInstruction,
-    math::{Decimal, Rate, TryAdd, TryDiv, TryMul, TrySub, WAD},
+    math::{Decimal, Rate, TryAdd, TryDiv, TryMul, TrySub},
     oracles::get_pyth_price,
     state::{
-        CalculateBorrowResult, CalculateLiquidationResult, CalculateRepayResult,
-        InitLendingMarketParams, InitObligationParams, InitReserveParams, LendingMarket,
-        NewReserveCollateralParams, NewReserveLiquidityParams, Obligation, Reserve,
+        validate_reserve_config, CalculateBorrowResult, CalculateLiquidationResult,
+        CalculateRepayResult, InitLendingMarketParams, InitObligationParams, InitReserveParams,
+        LendingMarket, NewReserveCollateralParams, NewReserveLiquidityParams, Obligation, Reserve,
         ReserveCollateral, ReserveConfig, ReserveLiquidity,
     },
 };
+use bytemuck::bytes_of;
 use pyth_sdk_solana::{self, state::ProductAccount};
 use solana_program::{
     account_info::{next_account_info, AccountInfo},
@@ -23,6 +24,7 @@ use solana_program::{
     program_error::ProgramError,
     program_pack::{IsInitialized, Pack},
     pubkey::Pubkey,
+    system_instruction::create_account,
     sysvar::instructions::{load_current_index_checked, load_instruction_at_checked},
     sysvar::{
         clock::{self, Clock},
@@ -30,7 +32,7 @@ use solana_program::{
         Sysvar,
     },
 };
-use solend_sdk::state::{RateLimiter, RateLimiterConfig};
+use solend_sdk::state::{LendingMarketMetadata, RateLimiter, RateLimiterConfig, ReserveType};
 use solend_sdk::{switchboard_v2_devnet, switchboard_v2_mainnet};
 use spl_token::state::Mint;
 use std::{cmp::min, result::Result};
@@ -63,6 +65,7 @@ pub fn process_instruction(
             new_owner,
             rate_limiter_config,
             whitelisted_liquidator,
+            risk_authority,
         } => {
             msg!("Instruction: Set Lending Market Owner");
             process_set_lending_market_owner_and_config(
@@ -70,6 +73,7 @@ pub fn process_instruction(
                 new_owner,
                 rate_limiter_config,
                 whitelisted_liquidator,
+                risk_authority,
                 accounts,
             )
         }
@@ -179,6 +183,15 @@ pub fn process_instruction(
                 accounts,
             )
         }
+        LendingInstruction::ForgiveDebt { liquidity_amount } => {
+            msg!("Instruction: Forgive Debt");
+            process_forgive_debt(program_id, liquidity_amount, accounts)
+        }
+        LendingInstruction::UpdateMarketMetadata => {
+            msg!("Instruction: Update Metadata");
+            let metadata = LendingMarketMetadata::new_from_bytes(input)?;
+            process_update_market_metadata(program_id, metadata, accounts)
+        }
     }
 }
 
@@ -221,6 +234,7 @@ fn process_set_lending_market_owner_and_config(
     new_owner: Pubkey,
     rate_limiter_config: RateLimiterConfig,
     whitelisted_liquidator: Option<Pubkey>,
+    risk_authority: Pubkey,
     accounts: &[AccountInfo],
 ) -> ProgramResult {
     let account_info_iter = &mut accounts.iter();
@@ -242,6 +256,7 @@ fn process_set_lending_market_owner_and_config(
     }
 
     lending_market.owner = new_owner;
+    lending_market.risk_authority = risk_authority;
 
     if rate_limiter_config != lending_market.rate_limiter.config {
         lending_market.rate_limiter = RateLimiter::new(rate_limiter_config, Clock::get()?.slot);
@@ -909,6 +924,7 @@ fn process_refresh_obligation(program_id: &Pubkey, accounts: &[AccountInfo]) -> 
     let mut borrowed_value_upper_bound = Decimal::zero();
     let mut allowed_borrow_value = Decimal::zero();
     let mut unhealthy_borrow_value = Decimal::zero();
+    let mut super_unhealthy_borrow_value = Decimal::zero();
 
     for (index, collateral) in obligation.deposits.iter_mut().enumerate() {
         let deposit_reserve_info = next_account_info(account_info_iter)?;
@@ -947,6 +963,8 @@ fn process_refresh_obligation(program_id: &Pubkey, accounts: &[AccountInfo]) -> 
         let loan_to_value_rate = Rate::from_percent(deposit_reserve.config.loan_to_value_ratio);
         let liquidation_threshold_rate =
             Rate::from_percent(deposit_reserve.config.liquidation_threshold);
+        let max_liquidation_threshold_rate =
+            Rate::from_percent(deposit_reserve.config.max_liquidation_threshold);
 
         collateral.market_value = market_value;
         deposited_value = deposited_value.try_add(market_value)?;
@@ -954,8 +972,12 @@ fn process_refresh_obligation(program_id: &Pubkey, accounts: &[AccountInfo]) -> 
             allowed_borrow_value.try_add(market_value_lower_bound.try_mul(loan_to_value_rate)?)?;
         unhealthy_borrow_value =
             unhealthy_borrow_value.try_add(market_value.try_mul(liquidation_threshold_rate)?)?;
+        super_unhealthy_borrow_value = super_unhealthy_borrow_value
+            .try_add(market_value.try_mul(max_liquidation_threshold_rate)?)?;
     }
 
+    let mut borrowing_isolated_asset = false;
+    let mut max_borrow_weight = None;
     for (index, liquidity) in obligation.borrows.iter_mut().enumerate() {
         let borrow_reserve_info = next_account_info(account_info_iter)?;
         if borrow_reserve_info.owner != program_id {
@@ -982,7 +1004,34 @@ fn process_refresh_obligation(program_id: &Pubkey, accounts: &[AccountInfo]) -> 
             return Err(LendingError::ReserveStale.into());
         }
 
+        if borrow_reserve.config.reserve_type == ReserveType::Isolated {
+            borrowing_isolated_asset = true;
+        }
+
         liquidity.accrue_interest(borrow_reserve.liquidity.cumulative_borrow_rate_wads)?;
+
+        let borrow_weight_and_pubkey = (
+            borrow_reserve.config.added_borrow_weight_bps,
+            borrow_reserve_info.key,
+        );
+        max_borrow_weight = match max_borrow_weight {
+            None => {
+                if liquidity.borrowed_amount_wads > Decimal::zero() {
+                    Some((borrow_weight_and_pubkey, index))
+                } else {
+                    None
+                }
+            }
+            Some((max_borrow_weight_and_pubkey, _)) => {
+                if liquidity.borrowed_amount_wads > Decimal::zero()
+                    && borrow_weight_and_pubkey > max_borrow_weight_and_pubkey
+                {
+                    Some((borrow_weight_and_pubkey, index))
+                } else {
+                    max_borrow_weight
+                }
+            }
+        };
 
         let market_value = borrow_reserve.market_value(liquidity.borrowed_amount_wads)?;
         let market_value_upper_bound =
@@ -1003,14 +1052,31 @@ fn process_refresh_obligation(program_id: &Pubkey, accounts: &[AccountInfo]) -> 
     obligation.deposited_value = deposited_value;
     obligation.borrowed_value = borrowed_value;
     obligation.borrowed_value_upper_bound = borrowed_value_upper_bound;
+    obligation.borrowing_isolated_asset = borrowing_isolated_asset;
 
     let global_unhealthy_borrow_value = Decimal::from(70000000u64);
     let global_allowed_borrow_value = Decimal::from(65000000u64);
 
     obligation.allowed_borrow_value = min(allowed_borrow_value, global_allowed_borrow_value);
     obligation.unhealthy_borrow_value = min(unhealthy_borrow_value, global_unhealthy_borrow_value);
+    obligation.super_unhealthy_borrow_value =
+        min(super_unhealthy_borrow_value, global_unhealthy_borrow_value);
 
     obligation.last_update.update_slot(clock.slot);
+
+    // move the ObligationLiquidity with the max borrow weight to the front
+    if let Some((_, max_borrow_weight_index)) = max_borrow_weight {
+        obligation.borrows.swap(0, max_borrow_weight_index);
+    }
+
+    // filter out ObligationCollaterals and ObligationLiquiditys with an amount of zero
+    obligation
+        .deposits
+        .retain(|collateral| collateral.deposited_amount > 0);
+    obligation
+        .borrows
+        .retain(|liquidity| liquidity.borrowed_amount_wads > Decimal::zero());
+
     Obligation::pack(obligation, &mut obligation_info.data.borrow_mut())?;
 
     Ok(())
@@ -1246,6 +1312,7 @@ fn process_withdraw_obligation_collateral(
         obligation_owner_info,
         clock,
         token_program_id,
+        false,
     )?;
     Ok(())
 }
@@ -1263,6 +1330,7 @@ fn _withdraw_obligation_collateral<'a>(
     obligation_owner_info: &AccountInfo<'a>,
     clock: &Clock,
     token_program_id: &AccountInfo<'a>,
+    account_for_rate_limiter: bool,
 ) -> Result<u64, ProgramError> {
     let lending_market = LendingMarket::unpack(&lending_market_info.data.borrow())?;
     if lending_market_info.owner != program_id {
@@ -1338,8 +1406,45 @@ fn _withdraw_obligation_collateral<'a>(
         return Err(LendingError::InvalidMarketAuthority.into());
     }
 
+    // account for lending market and reserve rate limiter when withdrawing. this is needed to
+    // support max withdraws.
+    let max_outflow_collateral_amount = if account_for_rate_limiter {
+        let max_outflow_usd = lending_market
+            .rate_limiter
+            .clone() // remaining_outflow is a mutable call, but we don't have mutable access here
+            .remaining_outflow(clock.slot)?;
+
+        let max_lending_market_outflow_liquidity_amount = withdraw_reserve
+            .usd_to_liquidity_amount_lower_bound(min(
+                max_outflow_usd,
+                // min here bc this function can overflow if max_outflow_usd is u64::MAX
+                // the actual value doesn't matter too much as long as its sensible
+                obligation.deposited_value.try_mul(2)?,
+            ))?;
+
+        let max_reserve_outflow_liquidity_amount = withdraw_reserve
+            .rate_limiter
+            .clone()
+            .remaining_outflow(clock.slot)?;
+
+        let max_outflow_liquidity_amount = min(
+            max_lending_market_outflow_liquidity_amount,
+            max_reserve_outflow_liquidity_amount,
+        );
+
+        withdraw_reserve
+            .collateral_exchange_rate()?
+            .decimal_liquidity_to_collateral(max_outflow_liquidity_amount)?
+            .try_floor_u64()?
+    } else {
+        u64::MAX
+    };
+
     let max_withdraw_amount = obligation.max_withdraw_amount(collateral, &withdraw_reserve)?;
-    let withdraw_amount = std::cmp::min(collateral_amount, max_withdraw_amount);
+    let withdraw_amount = min(
+        collateral_amount,
+        min(max_withdraw_amount, max_outflow_collateral_amount),
+    );
 
     if withdraw_amount == 0 {
         msg!("Maximum withdraw value is zero");
@@ -1478,6 +1583,33 @@ fn process_borrow_obligation_liquidity(
         return Err(LendingError::InvalidMarketAuthority.into());
     }
 
+    match borrow_reserve.config.reserve_type {
+        ReserveType::Isolated => match obligation.borrows.len() {
+            0 => {}
+            1 => {
+                if &obligation.borrows[0].borrow_reserve != borrow_reserve_info.key {
+                    msg!("If you want to borrow an isolated tier asset, there can't be any other borrows in your obligation");
+                    return Err(LendingError::IsolatedTierAssetViolation.into());
+                }
+            }
+            // it's possible that the obligation already has a borrow from this reserve (consider
+            // case the where we change a reserve asset type from regular to isolated), but in that
+            // case we don't want to let more borrows happen anyways.
+            _ => {
+                msg!("If you want to borrow an isolated tier asset, there can't be any other borrows in your obligation");
+                return Err(LendingError::IsolatedTierAssetViolation.into());
+            }
+        },
+        ReserveType::Regular => {
+            if obligation.borrowing_isolated_asset {
+                msg!(
+                    "Cannot borrow a regular tier asset if you have an isolated tier asset borrow"
+                );
+                return Err(LendingError::IsolatedTierAssetViolation.into());
+            }
+        }
+    };
+
     let remaining_borrow_value = obligation
         .remaining_borrow_value()
         .unwrap_or_else(|_| Decimal::zero());
@@ -1490,6 +1622,21 @@ fn process_borrow_obligation_liquidity(
         .try_sub(borrow_reserve.liquidity.borrowed_amount_wads)
         .unwrap_or_else(|_| Decimal::zero());
 
+    // account for rate limiter restrictions when calculating max borrow amount.
+    let max_outflow_liquidity_amount = {
+        let max_outflow_usd = lending_market.rate_limiter.remaining_outflow(clock.slot)?;
+        let max_outflow_tokens = borrow_reserve.rate_limiter.remaining_outflow(clock.slot)?;
+
+        min(
+            borrow_reserve.usd_to_liquidity_amount_lower_bound(min(
+                max_outflow_usd,
+                // min here bc this function can overflow if max_outflow_usd is u64::MAX
+                remaining_borrow_value,
+            ))?,
+            max_outflow_tokens,
+        )
+    };
+
     let CalculateBorrowResult {
         borrow_amount,
         receive_amount,
@@ -1498,7 +1645,7 @@ fn process_borrow_obligation_liquidity(
     } = borrow_reserve.calculate_borrow(
         liquidity_amount,
         remaining_borrow_value,
-        remaining_reserve_capacity,
+        min(remaining_reserve_capacity, max_outflow_liquidity_amount),
     )?;
 
     if receive_amount == 0 {
@@ -1705,7 +1852,7 @@ fn _liquidate_obligation<'a>(
     user_transfer_authority_info: &AccountInfo<'a>,
     clock: &Clock,
     token_program_id: &AccountInfo<'a>,
-) -> Result<u64, ProgramError> {
+) -> Result<(u64, Decimal), ProgramError> {
     let lending_market = LendingMarket::unpack(&lending_market_info.data.borrow())?;
     if lending_market_info.owner != program_id {
         msg!("Lending market provided is not owned by the lending program");
@@ -1809,6 +1956,10 @@ fn _liquidate_obligation<'a>(
         msg!("Obligation borrow value is zero");
         return Err(LendingError::ObligationLiquidityEmpty.into());
     }
+    if liquidity_index != 0 {
+        msg!("Obligation borrow is not the first liquidity in the borrows list");
+        return Err(LendingError::InvalidAccountInput.into());
+    }
 
     let (collateral, collateral_index) =
         obligation.find_collateral_in_deposits(*withdraw_reserve_info.key)?;
@@ -1834,6 +1985,7 @@ fn _liquidate_obligation<'a>(
         settle_amount,
         repay_amount,
         withdraw_amount,
+        bonus_rate,
     } = withdraw_reserve.calculate_liquidation(
         liquidity_amount,
         &obligation,
@@ -1877,7 +2029,7 @@ fn _liquidate_obligation<'a>(
         token_program: token_program_id.clone(),
     })?;
 
-    Ok(withdraw_amount)
+    Ok((withdraw_amount, bonus_rate))
 }
 
 #[inline(never)] // avoid stack frame limit
@@ -1909,7 +2061,7 @@ fn process_liquidate_obligation_and_redeem_reserve_collateral(
     let token_program_id = next_account_info(account_info_iter)?;
     let clock = &Clock::get()?;
 
-    let withdrawn_collateral_amount = _liquidate_obligation(
+    let (withdrawn_collateral_amount, bonus_rate) = _liquidate_obligation(
         program_id,
         liquidity_amount,
         source_liquidity_info,
@@ -1955,8 +2107,8 @@ fn process_liquidate_obligation_and_redeem_reserve_collateral(
             msg!("Withdraw reserve liquidity fee receiver does not match the reserve liquidity fee receiver provided");
             return Err(LendingError::InvalidAccountInput.into());
         }
-        let protocol_fee =
-            withdraw_reserve.calculate_protocol_liquidation_fee(withdraw_liquidity_amount)?;
+        let protocol_fee = withdraw_reserve
+            .calculate_protocol_liquidation_fee(withdraw_liquidity_amount, bonus_rate)?;
 
         spl_token_transfer(TokenTransferParams {
             source: destination_liquidity_info.clone(),
@@ -2007,6 +2159,7 @@ fn process_withdraw_obligation_collateral_and_redeem_reserve_liquidity(
         obligation_owner_info,
         clock,
         token_program_id,
+        true,
     )?;
 
     _redeem_reserve_collateral(
@@ -2039,7 +2192,7 @@ fn process_update_reserve_config(
     let reserve_info = next_account_info(account_info_iter)?;
     let lending_market_info = next_account_info(account_info_iter)?;
     let lending_market_authority_info = next_account_info(account_info_iter)?;
-    let lending_market_owner_info = next_account_info(account_info_iter)?;
+    let signer_info = next_account_info(account_info_iter)?;
     let pyth_product_info = next_account_info(account_info_iter)?;
     let pyth_price_info = next_account_info(account_info_iter)?;
     let switchboard_feed_info = next_account_info(account_info_iter)?;
@@ -2067,16 +2220,9 @@ fn process_update_reserve_config(
         );
         return Err(LendingError::InvalidAccountOwner.into());
     }
-    if &lending_market.owner != lending_market_owner_info.key {
-        msg!("Lending market owner does not match the lending market owner provided");
-        return Err(LendingError::InvalidMarketOwner.into());
-    }
-    if !lending_market_owner_info.is_signer {
-        msg!("Lending market owner provided must be a signer");
-        return Err(LendingError::InvalidSigner.into());
-    }
+
     // if it's a permissionless market
-    if &solend_market_owner::id() != lending_market_owner_info.key {
+    if &solend_market_owner::id() != signer_info.key {
         if reserve.config.protocol_liquidation_fee != config.protocol_liquidation_fee {
             msg!("permissionless markets can't edit protocol liquidation fees");
             return Err(LendingError::InvalidConfig.into());
@@ -2103,6 +2249,7 @@ fn process_update_reserve_config(
         lending_market_info.key.as_ref(),
         &[lending_market.bump_seed],
     ];
+
     let lending_market_authority_pubkey =
         Pubkey::create_program_address(authority_signer_seeds, program_id)?;
     if &lending_market_authority_pubkey != lending_market_authority_info.key {
@@ -2112,29 +2259,56 @@ fn process_update_reserve_config(
         return Err(LendingError::InvalidMarketAuthority.into());
     }
 
-    // if window duration or max outflow are different, then create a new rate limiter instance.
-    if rate_limiter_config != reserve.rate_limiter.config {
-        reserve.rate_limiter = RateLimiter::new(rate_limiter_config, Clock::get()?.slot);
+    if !signer_info.is_signer {
+        msg!("Lending market owner or risk authority provided must be a signer");
+        return Err(LendingError::InvalidSigner.into());
     }
 
-    if *pyth_price_info.key != reserve.liquidity.pyth_oracle_pubkey {
-        validate_pyth_keys(&lending_market, pyth_product_info, pyth_price_info)?;
-        reserve.liquidity.pyth_oracle_pubkey = *pyth_price_info.key;
+    if signer_info.key == &lending_market.owner {
+        // if window duration or max outflow are different, then create a new rate limiter instance.
+        if rate_limiter_config != reserve.rate_limiter.config {
+            reserve.rate_limiter = RateLimiter::new(rate_limiter_config, Clock::get()?.slot);
+        }
+
+        if *pyth_price_info.key != reserve.liquidity.pyth_oracle_pubkey {
+            validate_pyth_keys(&lending_market, pyth_product_info, pyth_price_info)?;
+            reserve.liquidity.pyth_oracle_pubkey = *pyth_price_info.key;
+        }
+
+        if *switchboard_feed_info.key != reserve.liquidity.switchboard_oracle_pubkey {
+            validate_switchboard_keys(&lending_market, switchboard_feed_info)?;
+            reserve.liquidity.switchboard_oracle_pubkey = *switchboard_feed_info.key;
+        }
+        if reserve.liquidity.switchboard_oracle_pubkey == solend_program::NULL_PUBKEY
+            && (*pyth_price_info.key == solend_program::NULL_PUBKEY
+                || *pyth_product_info.key == solend_program::NULL_PUBKEY)
+        {
+            msg!("At least one price oracle must have a non-null pubkey");
+            return Err(LendingError::InvalidOracleConfig.into());
+        }
+
+        reserve.config = config;
+    } else if signer_info.key == &lending_market.risk_authority {
+        // only can disable outflows
+        if rate_limiter_config.window_duration > 0 && rate_limiter_config.max_outflow == 0 {
+            reserve.rate_limiter = RateLimiter::new(rate_limiter_config, Clock::get()?.slot);
+        }
+
+        // only certain reserve config fields can be changed by the risk authority, and only in the
+        // safer direction for now
+        if config.borrow_limit < reserve.config.borrow_limit {
+            reserve.config.borrow_limit = config.borrow_limit;
+        }
+
+        if config.deposit_limit < reserve.config.deposit_limit {
+            reserve.config.deposit_limit = config.deposit_limit;
+        }
+    } else {
+        msg!("Signer must be the Lending market owner or risk authority");
+        return Err(LendingError::InvalidSigner.into());
     }
 
-    if *switchboard_feed_info.key != reserve.liquidity.switchboard_oracle_pubkey {
-        validate_switchboard_keys(&lending_market, switchboard_feed_info)?;
-        reserve.liquidity.switchboard_oracle_pubkey = *switchboard_feed_info.key;
-    }
-    if reserve.liquidity.switchboard_oracle_pubkey == solend_program::NULL_PUBKEY
-        && (*pyth_price_info.key == solend_program::NULL_PUBKEY
-            || *pyth_product_info.key == solend_program::NULL_PUBKEY)
-    {
-        msg!("At least one price oracle must have a non-null pubkey");
-        return Err(LendingError::InvalidOracleConfig.into());
-    }
-
-    reserve.config = config;
+    reserve.last_update.mark_stale();
     Reserve::pack(reserve, &mut reserve_info.data.borrow_mut())?;
     Ok(())
 }
@@ -2575,6 +2749,97 @@ fn _flash_repay_reserve_liquidity<'a>(
     Ok(())
 }
 
+fn process_forgive_debt(
+    program_id: &Pubkey,
+    liquidity_amount: u64,
+    accounts: &[AccountInfo],
+) -> ProgramResult {
+    let account_info_iter = &mut accounts.iter();
+    let obligation_info = next_account_info(account_info_iter)?;
+    let reserve_info = next_account_info(account_info_iter)?;
+    let lending_market_info = next_account_info(account_info_iter)?;
+    let lending_market_owner_info = next_account_info(account_info_iter)?;
+
+    let lending_market = LendingMarket::unpack(&lending_market_info.data.borrow())?;
+    if lending_market_info.owner != program_id {
+        msg!(
+            "Lending market provided is not owned by the lending program  {} != {}",
+            &lending_market_info.owner.to_string(),
+            &program_id.to_string(),
+        );
+        return Err(LendingError::InvalidAccountOwner.into());
+    }
+    if &lending_market.owner != lending_market_owner_info.key {
+        msg!("Lending market owner does not match the lending market owner provided");
+        return Err(LendingError::InvalidMarketOwner.into());
+    }
+    if !lending_market_owner_info.is_signer {
+        msg!("Lending market owner provided must be a signer");
+        return Err(LendingError::InvalidSigner.into());
+    }
+
+    let mut reserve = Reserve::unpack(&reserve_info.data.borrow())?;
+    if reserve_info.owner != program_id {
+        msg!("Reserve provided is not owned by the lending program");
+        return Err(LendingError::InvalidAccountOwner.into());
+    }
+    if &reserve.lending_market != lending_market_info.key {
+        msg!("Reserve lending market does not match the lending market provided");
+        return Err(LendingError::InvalidAccountInput.into());
+    }
+    if reserve.last_update.is_stale(Clock::get()?.slot)? {
+        msg!("Reserve is stale and must be refreshed in the current slot");
+        return Err(LendingError::ReserveStale.into());
+    }
+
+    let mut obligation = Obligation::unpack(&obligation_info.data.borrow())?;
+    if obligation_info.owner != program_id {
+        msg!("Obligation provided is not owned by the lending program");
+        return Err(LendingError::InvalidAccountOwner.into());
+    }
+    if &obligation.lending_market != lending_market_info.key {
+        msg!("Obligation lending market does not match the lending market provided");
+        return Err(LendingError::InvalidAccountInput.into());
+    }
+    if obligation.last_update.is_stale(Clock::get()?.slot)? {
+        msg!("Obligation is stale and must be refreshed in the current slot");
+        return Err(LendingError::ObligationStale.into());
+    }
+    if !obligation.deposits.is_empty() {
+        msg!("Obligation hasn't been fully liquidated!");
+        return Err(LendingError::InvalidAccountInput.into());
+    }
+
+    // in the case where the entire reserve got rugged for whatever reason, we still don't
+    // want to forgive the entire reserve's supply because that'll mess with the ctoken ratio
+    // and cause overflow/div by zero issues in other places. therefore, we want to make sure the ctoken
+    // ratio is >= 1% after forgiveness.
+    //
+    // new ctoken ratio = (total_liquidity_supply - forgive_amount) / collateral_mint_supply >= 0.01
+    // -> forgive_amount <= (total_liquidity_supply - collateral_mint_supply * 0.01)
+    const MIN_CTOKEN_RATIO_PERCENT: u8 = 1;
+    let max_forgive_amount = reserve.liquidity.total_supply()?.try_sub(
+        Decimal::from(reserve.collateral.mint_total_supply)
+            .try_mul(Decimal::from_percent(MIN_CTOKEN_RATIO_PERCENT))?,
+    )?;
+
+    let (liquidity, liquidity_index) = obligation.find_liquidity_in_borrows(*reserve_info.key)?;
+    let forgive_amount = min(
+        Decimal::from(liquidity_amount),
+        min(liquidity.borrowed_amount_wads, max_forgive_amount),
+    );
+
+    reserve.liquidity.forgive_debt(forgive_amount)?;
+    reserve.last_update.mark_stale();
+    Reserve::pack(reserve, &mut reserve_info.data.borrow_mut())?;
+
+    obligation.repay(forgive_amount, liquidity_index)?;
+    obligation.last_update.mark_stale();
+    Obligation::pack(obligation, &mut obligation_info.data.borrow_mut())?;
+
+    Ok(())
+}
+
 fn assert_rent_exempt(rent: &Rent, account_info: &AccountInfo) -> ProgramResult {
     if !rent.is_exempt(account_info.lamports(), account_info.data_len()) {
         msg!(
@@ -2586,6 +2851,72 @@ fn assert_rent_exempt(rent: &Rent, account_info: &AccountInfo) -> ProgramResult 
     } else {
         Ok(())
     }
+}
+
+fn process_update_market_metadata(
+    program_id: &Pubkey,
+    metadata: &LendingMarketMetadata,
+    accounts: &[AccountInfo],
+) -> Result<(), ProgramError> {
+    let account_info_iter = &mut accounts.iter();
+    let lending_market_info = next_account_info(account_info_iter)?;
+    let lending_market_owner_info = next_account_info(account_info_iter)?;
+    let metadata_info = next_account_info(account_info_iter)?;
+
+    let lending_market = LendingMarket::unpack(&lending_market_info.data.borrow())?;
+    if lending_market_info.owner != program_id {
+        msg!("Lending market provided is not owned by the lending program",);
+        return Err(LendingError::InvalidAccountOwner.into());
+    }
+
+    if &lending_market.owner != lending_market_owner_info.key {
+        msg!("Lending market owner does not match the lending market owner provided");
+        return Err(LendingError::InvalidMarketOwner.into());
+    }
+
+    if !lending_market_owner_info.is_signer {
+        msg!("Lending market owner provided must be a signer");
+        return Err(LendingError::InvalidSigner.into());
+    }
+
+    let metadata_seeds = &[lending_market_info.key.as_ref(), b"MetaData"];
+    let (metadata_key, bump_seed) = Pubkey::find_program_address(metadata_seeds, program_id);
+    if metadata_key != *metadata_info.key {
+        msg!("Provided metadata account does not match the expected derived address");
+        return Err(LendingError::InvalidAccountInput.into());
+    }
+
+    if bump_seed != metadata.bump_seed {
+        msg!("Provided bump seed does not match the expected derived bump seed");
+        return Err(LendingError::InvalidAmount.into());
+    }
+
+    // initialize
+    if metadata_info.data_is_empty() {
+        msg!("Creating metadata account");
+
+        invoke_signed(
+            &create_account(
+                lending_market_owner_info.key,
+                metadata_info.key,
+                Rent::get()?.minimum_balance(std::mem::size_of::<LendingMarketMetadata>()),
+                std::mem::size_of::<LendingMarketMetadata>() as u64,
+                program_id,
+            ),
+            &[lending_market_owner_info.clone(), metadata_info.clone()],
+            &[&[lending_market_info.key.as_ref(), br"MetaData", &[bump_seed]]],
+        )?;
+    }
+
+    if metadata_info.owner != program_id {
+        msg!("Metadata provided is not owned by the lending program");
+        return Err(LendingError::InvalidAccountOwner.into());
+    }
+
+    let mut metadata_account_data = metadata_info.try_borrow_mut_data()?;
+    metadata_account_data.copy_from_slice(bytes_of(metadata));
+
+    Ok(())
 }
 
 fn assert_uninitialized<T: Pack + IsInitialized>(
@@ -2855,54 +3186,6 @@ fn spl_token_burn(params: TokenBurnParams<'_, '_>) -> ProgramResult {
         authority_signer_seeds,
     );
     result.map_err(|_| LendingError::TokenBurnFailed.into())
-}
-
-/// validates reserve configs
-#[inline(always)]
-fn validate_reserve_config(config: ReserveConfig) -> ProgramResult {
-    if config.optimal_utilization_rate > 100 {
-        msg!("Optimal utilization rate must be in range [0, 100]");
-        return Err(LendingError::InvalidConfig.into());
-    }
-    if config.loan_to_value_ratio >= 100 {
-        msg!("Loan to value ratio must be in range [0, 100)");
-        return Err(LendingError::InvalidConfig.into());
-    }
-    if config.liquidation_bonus > 100 {
-        msg!("Liquidation bonus must be in range [0, 100]");
-        return Err(LendingError::InvalidConfig.into());
-    }
-    if config.liquidation_threshold < config.loan_to_value_ratio
-        || config.liquidation_threshold > 100
-    {
-        msg!("Liquidation threshold must be in range [LTV, 100]");
-        return Err(LendingError::InvalidConfig.into());
-    }
-    if config.optimal_borrow_rate < config.min_borrow_rate {
-        msg!("Optimal borrow rate must be >= min borrow rate");
-        return Err(LendingError::InvalidConfig.into());
-    }
-    if config.optimal_borrow_rate > config.max_borrow_rate {
-        msg!("Optimal borrow rate must be <= max borrow rate");
-        return Err(LendingError::InvalidConfig.into());
-    }
-    if config.fees.borrow_fee_wad >= WAD {
-        msg!("Borrow fee must be in range [0, 1_000_000_000_000_000_000)");
-        return Err(LendingError::InvalidConfig.into());
-    }
-    if config.fees.host_fee_percentage > 100 {
-        msg!("Host fee percentage must be in range [0, 100]");
-        return Err(LendingError::InvalidConfig.into());
-    }
-    if config.protocol_liquidation_fee > 100 {
-        msg!("Protocol liquidation fee must be in range [0, 100]");
-        return Err(LendingError::InvalidConfig.into());
-    }
-    if config.protocol_take_rate > 100 {
-        msg!("Protocol take rate must be in range [0, 100]");
-        return Err(LendingError::InvalidConfig.into());
-    }
-    Ok(())
 }
 
 /// validates pyth AccountInfos

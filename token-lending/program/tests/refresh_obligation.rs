@@ -2,7 +2,17 @@
 
 mod helpers;
 
+use crate::solend_program_test::custom_scenario;
+use crate::solend_program_test::ObligationArgs;
 use crate::solend_program_test::PriceArgs;
+use crate::solend_program_test::ReserveArgs;
+use helpers::AddPacked;
+use solana_sdk::pubkey::Pubkey;
+use solend_program::instruction::refresh_obligation;
+use solend_program::processor::process_instruction;
+
+use solend_program::state::ObligationCollateral;
+use solend_sdk::state::PROGRAM_VERSION;
 use std::collections::HashSet;
 
 use helpers::solend_program_test::{setup_world, BalanceChecker, Info, SolendProgramTest, User};
@@ -98,7 +108,7 @@ async fn setup() -> (
             &wsol_reserve,
             &obligation,
             &user,
-            &lending_market_owner.get_account(&wsol_mint::id()).unwrap(),
+            lending_market_owner.get_account(&wsol_mint::id()),
             u64::MAX,
         )
         .await
@@ -276,5 +286,287 @@ async fn test_success() {
 
             ..obligation.account
         }
+    );
+}
+
+#[tokio::test]
+async fn test_obligation_liquidity_ordering() {
+    let (mut test, lending_market, reserves, obligations, _users, lending_market_owner) =
+        custom_scenario(
+            &[
+                ReserveArgs {
+                    mint: usdc_mint::id(),
+                    config: ReserveConfig {
+                        optimal_borrow_rate: 0,
+                        max_borrow_rate: 0,
+                        ..test_reserve_config()
+                    },
+                    liquidity_amount: 100_000 * FRACTIONAL_TO_USDC,
+                    price: PriceArgs {
+                        price: 10,
+                        conf: 0,
+                        expo: -1,
+                        ema_price: 10,
+                        ema_conf: 1,
+                    },
+                },
+                ReserveArgs {
+                    mint: bonk_mint::id(),
+                    config: ReserveConfig {
+                        loan_to_value_ratio: 0,
+                        liquidation_threshold: 0,
+                        fees: ReserveFees {
+                            host_fee_percentage: 0,
+                            ..ReserveFees::default()
+                        },
+                        optimal_borrow_rate: 0,
+                        max_borrow_rate: 0,
+                        ..test_reserve_config()
+                    },
+                    liquidity_amount: 100 * LAMPORTS_PER_SOL,
+                    price: PriceArgs {
+                        price: 10,
+                        conf: 0,
+                        expo: 0,
+                        ema_price: 10,
+                        ema_conf: 0,
+                    },
+                },
+                ReserveArgs {
+                    mint: usdt_mint::id(),
+                    config: ReserveConfig {
+                        loan_to_value_ratio: 0,
+                        liquidation_threshold: 0,
+                        fees: ReserveFees {
+                            host_fee_percentage: 0,
+                            ..ReserveFees::default()
+                        },
+                        optimal_borrow_rate: 0,
+                        max_borrow_rate: 0,
+                        ..test_reserve_config()
+                    },
+                    liquidity_amount: 100 * LAMPORTS_PER_SOL,
+                    price: PriceArgs {
+                        price: 10,
+                        conf: 0,
+                        expo: 0,
+                        ema_price: 10,
+                        ema_conf: 0,
+                    },
+                },
+                ReserveArgs {
+                    mint: wsol_mint::id(),
+                    config: ReserveConfig {
+                        loan_to_value_ratio: 0,
+                        liquidation_threshold: 0,
+                        fees: ReserveFees {
+                            host_fee_percentage: 0,
+                            ..ReserveFees::default()
+                        },
+                        optimal_borrow_rate: 0,
+                        max_borrow_rate: 0,
+                        ..test_reserve_config()
+                    },
+                    liquidity_amount: 100 * LAMPORTS_PER_SOL,
+                    price: PriceArgs {
+                        price: 10,
+                        conf: 0,
+                        expo: 0,
+                        ema_price: 10,
+                        ema_conf: 0,
+                    },
+                },
+            ],
+            &[ObligationArgs {
+                deposits: vec![(usdc_mint::id(), 100 * FRACTIONAL_TO_USDC)],
+                borrows: vec![
+                    (wsol_mint::id(), 1),
+                    (usdt_mint::id(), 1),
+                    (usdc_mint::id(), 1),
+                    (bonk_mint::id(), 1),
+                ],
+            }],
+        )
+        .await;
+
+    let wsol_reserve = reserves
+        .iter()
+        .find(|r| r.account.liquidity.mint_pubkey == wsol_mint::id())
+        .unwrap();
+    let usdc_reserve = reserves
+        .iter()
+        .find(|r| r.account.liquidity.mint_pubkey == usdc_mint::id())
+        .unwrap();
+
+    lending_market
+        .refresh_obligation(&mut test, &obligations[0])
+        .await
+        .unwrap();
+
+    let obligation = test.load_account::<Obligation>(obligations[0].pubkey).await;
+    let max_reserve = reserves.iter().max_by_key(|r| r.pubkey).unwrap();
+    assert!(obligation.account.borrows[0].borrow_reserve == max_reserve.pubkey);
+
+    lending_market
+        .update_reserve_config(
+            &mut test,
+            &lending_market_owner,
+            wsol_reserve,
+            ReserveConfig {
+                added_borrow_weight_bps: 1,
+                ..wsol_reserve.account.config
+            },
+            wsol_reserve.account.rate_limiter.config,
+            None,
+        )
+        .await
+        .unwrap();
+
+    test.advance_clock_by_slots(1).await;
+
+    lending_market
+        .refresh_obligation(&mut test, &obligations[0])
+        .await
+        .unwrap();
+
+    let obligation = test.load_account::<Obligation>(obligations[0].pubkey).await;
+    assert!(obligation.account.borrows[0].borrow_reserve == wsol_reserve.pubkey);
+
+    lending_market
+        .update_reserve_config(
+            &mut test,
+            &lending_market_owner,
+            usdc_reserve,
+            ReserveConfig {
+                added_borrow_weight_bps: 2,
+                ..usdc_reserve.account.config
+            },
+            usdc_reserve.account.rate_limiter.config,
+            None,
+        )
+        .await
+        .unwrap();
+
+    test.advance_clock_by_slots(1).await;
+
+    lending_market
+        .refresh_obligation(&mut test, &obligations[0])
+        .await
+        .unwrap();
+
+    let obligation = test.load_account::<Obligation>(obligations[0].pubkey).await;
+    assert!(obligation.account.borrows[0].borrow_reserve == usdc_reserve.pubkey);
+}
+
+#[tokio::test]
+async fn test_normalize_obligation() {
+    let mut test = ProgramTest::new(
+        "solend_program",
+        solend_program::id(),
+        processor!(process_instruction),
+    );
+
+    let reserve_1 = Reserve {
+        version: PROGRAM_VERSION,
+        last_update: LastUpdate {
+            slot: 1,
+            stale: false,
+        },
+        ..Reserve::default()
+    };
+    let reserve_1_pubkey = Pubkey::new_unique();
+
+    test.add_packable_account(
+        reserve_1_pubkey,
+        u32::MAX as u64,
+        &reserve_1,
+        &solend_program::id(),
+    );
+
+    let reserve_2 = Reserve {
+        version: PROGRAM_VERSION,
+        last_update: LastUpdate {
+            slot: 1,
+            stale: false,
+        },
+        ..Reserve::default()
+    };
+    let reserve_2_pubkey = Pubkey::new_unique();
+
+    test.add_packable_account(
+        reserve_2_pubkey,
+        u32::MAX as u64,
+        &reserve_2,
+        &solend_program::id(),
+    );
+
+    let obligation_pubkey = Pubkey::new_unique();
+    let obligation = Obligation {
+        version: PROGRAM_VERSION,
+        deposits: vec![
+            ObligationCollateral {
+                deposit_reserve: reserve_1_pubkey,
+                deposited_amount: 1u64,
+                ..ObligationCollateral::default()
+            },
+            ObligationCollateral {
+                deposit_reserve: reserve_2_pubkey,
+                deposited_amount: 0u64,
+                ..ObligationCollateral::default()
+            },
+        ],
+        borrows: vec![
+            ObligationLiquidity {
+                borrow_reserve: reserve_1_pubkey,
+                borrowed_amount_wads: Decimal::from(0u64),
+                ..ObligationLiquidity::default()
+            },
+            ObligationLiquidity {
+                borrow_reserve: reserve_2_pubkey,
+                borrowed_amount_wads: Decimal::from(1u64),
+                ..ObligationLiquidity::default()
+            },
+        ],
+        ..Obligation::default()
+    };
+
+    test.add_packable_account(
+        obligation_pubkey,
+        u32::MAX as u64,
+        &obligation,
+        &solend_program::id(),
+    );
+
+    let mut test = SolendProgramTest::start_with_test(test).await;
+
+    let ix = [refresh_obligation(
+        solend_program::id(),
+        obligation_pubkey,
+        vec![
+            reserve_1_pubkey,
+            reserve_2_pubkey,
+            reserve_1_pubkey,
+            reserve_2_pubkey,
+        ],
+    )];
+    test.process_transaction(&ix, None).await.unwrap();
+
+    let o = test.load_account::<Obligation>(obligation_pubkey).await;
+    assert_eq!(
+        o.account.deposits,
+        vec![ObligationCollateral {
+            deposit_reserve: reserve_1_pubkey,
+            deposited_amount: 1u64,
+            ..ObligationCollateral::default()
+        }]
+    );
+
+    assert_eq!(
+        o.account.borrows,
+        vec![ObligationLiquidity {
+            borrow_reserve: reserve_2_pubkey,
+            borrowed_amount_wads: Decimal::from(1u64),
+            ..ObligationLiquidity::default()
+        }]
     );
 }

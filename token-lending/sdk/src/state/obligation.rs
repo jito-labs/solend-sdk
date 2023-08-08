@@ -52,6 +52,13 @@ pub struct Obligation {
     /// ie sum(d.deposited_amount * d.liquidation_threshold * d.current_spot_price for d in deposits)
     /// if borrowed_value >= unhealthy_borrow_value, the obligation can be liquidated
     pub unhealthy_borrow_value: Decimal,
+    /// ie sum(d.deposited_amount * d.max_liquidation_threshold * d.current_spot_price for d in
+    /// deposits). This field is used to calculate the liquidator bonus.
+    /// An obligation with a borrowed value >= super_unhealthy_borrow_value is eligible for the max
+    /// bonus
+    pub super_unhealthy_borrow_value: Decimal,
+    /// True if the obligation is currently borrowing an isolated tier asset
+    pub borrowing_isolated_asset: bool,
 }
 
 impl Obligation {
@@ -422,6 +429,8 @@ impl Pack for Obligation {
             allowed_borrow_value,
             unhealthy_borrow_value,
             borrowed_value_upper_bound,
+            borrowing_isolated_asset,
+            super_unhealthy_borrow_value,
             _padding,
             deposits_len,
             borrows_len,
@@ -438,7 +447,9 @@ impl Pack for Obligation {
             16,
             16,
             16,
-            48,
+            1,
+            16,
+            31,
             1,
             1,
             OBLIGATION_COLLATERAL_LEN + (OBLIGATION_LIQUIDITY_LEN * (MAX_OBLIGATION_RESERVES - 1))
@@ -455,6 +466,12 @@ impl Pack for Obligation {
         pack_decimal(self.borrowed_value_upper_bound, borrowed_value_upper_bound);
         pack_decimal(self.allowed_borrow_value, allowed_borrow_value);
         pack_decimal(self.unhealthy_borrow_value, unhealthy_borrow_value);
+        pack_bool(self.borrowing_isolated_asset, borrowing_isolated_asset);
+        pack_decimal(
+            self.super_unhealthy_borrow_value,
+            super_unhealthy_borrow_value,
+        );
+
         *deposits_len = u8::try_from(self.deposits.len()).unwrap().to_le_bytes();
         *borrows_len = u8::try_from(self.borrows.len()).unwrap().to_le_bytes();
 
@@ -509,6 +526,8 @@ impl Pack for Obligation {
             allowed_borrow_value,
             unhealthy_borrow_value,
             borrowed_value_upper_bound,
+            borrowing_isolated_asset,
+            super_unhealthy_borrow_value,
             _padding,
             deposits_len,
             borrows_len,
@@ -525,7 +544,9 @@ impl Pack for Obligation {
             16,
             16,
             16,
-            48,
+            1,
+            16,
+            31,
             1,
             1,
             OBLIGATION_COLLATERAL_LEN + (OBLIGATION_LIQUIDITY_LEN * (MAX_OBLIGATION_RESERVES - 1))
@@ -589,6 +610,8 @@ impl Pack for Obligation {
             borrowed_value_upper_bound: unpack_decimal(borrowed_value_upper_bound),
             allowed_borrow_value: unpack_decimal(allowed_borrow_value),
             unhealthy_borrow_value: unpack_decimal(unhealthy_borrow_value),
+            super_unhealthy_borrow_value: unpack_decimal(super_unhealthy_borrow_value),
+            borrowing_isolated_asset: unpack_bool(borrowing_isolated_asset)?,
         })
     }
 }
@@ -598,9 +621,53 @@ mod test {
     use super::*;
     use crate::math::TryAdd;
     use proptest::prelude::*;
+    use rand::Rng;
     use solana_program::native_token::LAMPORTS_PER_SOL;
 
     const MAX_COMPOUNDED_INTEREST: u64 = 100; // 10,000%
+
+    fn rand_decimal() -> Decimal {
+        Decimal::from_scaled_val(rand::thread_rng().gen())
+    }
+
+    #[test]
+    fn pack_and_unpack_obligation() {
+        let mut rng = rand::thread_rng();
+        for _ in 0..100 {
+            let obligation = Obligation {
+                version: PROGRAM_VERSION,
+                last_update: LastUpdate {
+                    slot: rng.gen(),
+                    stale: rng.gen(),
+                },
+                lending_market: Pubkey::new_unique(),
+                owner: Pubkey::new_unique(),
+                deposits: vec![ObligationCollateral {
+                    deposit_reserve: Pubkey::new_unique(),
+                    deposited_amount: rng.gen(),
+                    market_value: rand_decimal(),
+                }],
+                borrows: vec![ObligationLiquidity {
+                    borrow_reserve: Pubkey::new_unique(),
+                    cumulative_borrow_rate_wads: rand_decimal(),
+                    borrowed_amount_wads: rand_decimal(),
+                    market_value: rand_decimal(),
+                }],
+                deposited_value: rand_decimal(),
+                borrowed_value: rand_decimal(),
+                borrowed_value_upper_bound: rand_decimal(),
+                allowed_borrow_value: rand_decimal(),
+                unhealthy_borrow_value: rand_decimal(),
+                super_unhealthy_borrow_value: rand_decimal(),
+                borrowing_isolated_asset: rng.gen(),
+            };
+
+            let mut packed = [0u8; OBLIGATION_LEN];
+            Obligation::pack(obligation.clone(), &mut packed).unwrap();
+            let unpacked = Obligation::unpack(&packed).unwrap();
+            assert_eq!(obligation, unpacked);
+        }
+    }
 
     #[test]
     fn obligation_accrue_interest_failure() {

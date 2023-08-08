@@ -1,6 +1,6 @@
 [package]
 name = "solend-program"
-version = "0.1.0"
+version = "2.0.2"
 description = "Solend Program"
 authors = ["Solend Maintainers <maintainers@solend.fi>"]
 repository = "https://github.com/solendprotocol/solana-program-library"
@@ -19,6 +19,7 @@ solend-sdk = { path = "../sdk" }
 static_assertions = "1.1.0"
 switchboard-program = "0.2.0"
 switchboard-v2 = "0.1.3"
+bytemuck = "1.5.1"
 
 [dev-dependencies]
 assert_matches = "1.5.0"
@@ -36,6 +37,7 @@ borsh = "0.9.3"
 
 [lib]
 crate-type = ["cdylib", "lib"]
+name = "solend_program"
 
 [profile.release]
 lto = "fat"

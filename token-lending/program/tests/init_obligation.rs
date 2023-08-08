@@ -47,7 +47,9 @@ async fn test_success() {
             borrowed_value: Decimal::zero(),
             borrowed_value_upper_bound: Decimal::zero(),
             allowed_borrow_value: Decimal::zero(),
-            unhealthy_borrow_value: Decimal::zero()
+            unhealthy_borrow_value: Decimal::zero(),
+            super_unhealthy_borrow_value: Decimal::zero(),
+            borrowing_isolated_asset: false
         }
     );
 }

@@ -15,7 +15,7 @@ use solana_sdk::transaction::TransactionError;
 use solend_program::error::LendingError;
 
 use solend_program::state::ReserveConfig;
-use solend_program::NULL_PUBKEY;
+
 use solend_sdk::state::ReserveFees;
 mod helpers;
 
@@ -29,7 +29,7 @@ use std::collections::HashSet;
 
 #[tokio::test]
 async fn test_borrow() {
-    let (mut test, lending_market, reserves, obligation, user) = custom_scenario(
+    let (mut test, lending_market, reserves, obligations, users, _) = custom_scenario(
         &[
             ReserveArgs {
                 mint: usdc_mint::id(),
@@ -63,10 +63,10 @@ async fn test_borrow() {
                 },
             },
         ],
-        &ObligationArgs {
+        &[ObligationArgs {
             deposits: vec![(usdc_mint::id(), 100 * FRACTIONAL_TO_USDC)],
             borrows: vec![(wsol_mint::id(), LAMPORTS_PER_SOL)],
-        },
+        }],
     )
     .await;
 
@@ -97,7 +97,7 @@ async fn test_borrow() {
 
     test.advance_clock_by_slots(1).await;
 
-    let balance_checker = BalanceChecker::start(&mut test, &[&user]).await;
+    let balance_checker = BalanceChecker::start(&mut test, &[&users[0]]).await;
 
     // obligation currently has 100 USDC deposited and 1 sol borrowed
     // if we try to borrow the max amount, how much SOL should we receive?
@@ -108,9 +108,9 @@ async fn test_borrow() {
         .borrow_obligation_liquidity(
             &mut test,
             &find_reserve(&reserves, &wsol_mint::id()).unwrap(),
-            &obligation,
-            &user,
-            &NULL_PUBKEY,
+            &obligations[0],
+            &users[0],
+            None,
             u64::MAX,
         )
         .await
@@ -118,7 +118,7 @@ async fn test_borrow() {
 
     let (balance_changes, _) = balance_checker.find_balance_changes(&mut test).await;
     let expected_balance_changes = HashSet::from([TokenBalanceChange {
-        token_account: user.get_account(&wsol_mint::id()).unwrap(),
+        token_account: users[0].get_account(&wsol_mint::id()).unwrap(),
         mint: wsol_mint::id(),
         diff: (LAMPORTS_PER_SOL * 125 / 100) as i128,
     }]);
@@ -132,9 +132,9 @@ async fn test_borrow() {
         .borrow_obligation_liquidity(
             &mut test,
             &find_reserve(&reserves, &wsol_mint::id()).unwrap(),
-            &obligation,
-            &user,
-            &NULL_PUBKEY,
+            &obligations[0],
+            &users[0],
+            None,
             u64::MAX,
         )
         .await
@@ -144,7 +144,7 @@ async fn test_borrow() {
     assert_eq!(
         err,
         TransactionError::InstructionError(
-            3,
+            1,
             InstructionError::Custom(LendingError::BorrowTooLarge as u32)
         )
     );
@@ -152,7 +152,7 @@ async fn test_borrow() {
 
 #[tokio::test]
 async fn test_withdraw() {
-    let (mut test, lending_market, reserves, obligation, user) = custom_scenario(
+    let (mut test, lending_market, reserves, obligations, users, _) = custom_scenario(
         &[
             ReserveArgs {
                 mint: usdc_mint::id(),
@@ -198,13 +198,13 @@ async fn test_withdraw() {
                 },
             },
         ],
-        &ObligationArgs {
+        &[ObligationArgs {
             deposits: vec![
                 (usdc_mint::id(), 100 * FRACTIONAL_TO_USDC),
                 (usdt_mint::id(), 20 * FRACTIONAL_TO_USDC),
             ],
             borrows: vec![(wsol_mint::id(), LAMPORTS_PER_SOL)],
-        },
+        }],
     )
     .await;
 
@@ -235,14 +235,14 @@ async fn test_withdraw() {
 
     test.advance_clock_by_slots(1).await;
 
-    let balance_checker = BalanceChecker::start(&mut test, &[&user]).await;
+    let balance_checker = BalanceChecker::start(&mut test, &[&users[0]]).await;
 
     lending_market
         .withdraw_obligation_collateral_and_redeem_reserve_collateral(
             &mut test,
             &find_reserve(&reserves, &usdc_mint::id()).unwrap(),
-            &obligation,
-            &user,
+            &obligations[0],
+            &users[0],
             u64::MAX,
         )
         .await
@@ -263,7 +263,7 @@ async fn test_withdraw() {
     // we have successfully borrowed the max amount
     let (balance_changes, _) = balance_checker.find_balance_changes(&mut test).await;
     let expected_balance_changes = HashSet::from([TokenBalanceChange {
-        token_account: user.get_account(&usdc_mint::id()).unwrap(),
+        token_account: users[0].get_account(&usdc_mint::id()).unwrap(),
         mint: usdc_mint::id(),
         diff: (80 * FRACTIONAL_TO_USDC) as i128,
     }]);
@@ -278,8 +278,8 @@ async fn test_withdraw() {
             .withdraw_obligation_collateral_and_redeem_reserve_collateral(
                 &mut test,
                 &find_reserve(&reserves, &mint).unwrap(),
-                &obligation,
-                &user,
+                &obligations[0],
+                &users[0],
                 u64::MAX,
             )
             .await
@@ -289,7 +289,7 @@ async fn test_withdraw() {
         assert_eq!(
             err,
             TransactionError::InstructionError(
-                4,
+                1,
                 InstructionError::Custom(LendingError::WithdrawTooLarge as u32)
             )
         );
@@ -298,11 +298,16 @@ async fn test_withdraw() {
 
 #[tokio::test]
 async fn test_liquidation_doesnt_use_smoothed_price() {
-    let (mut test, lending_market, reserves, obligation, user) = custom_scenario(
+    let (mut test, lending_market, reserves, obligations, users, _) = custom_scenario(
         &[
             ReserveArgs {
                 mint: usdc_mint::id(),
-                config: test_reserve_config(),
+                config: ReserveConfig {
+                    protocol_liquidation_fee: 0,
+                    liquidation_bonus: 5,
+                    max_liquidation_bonus: 5,
+                    ..test_reserve_config()
+                },
                 liquidity_amount: 100_000 * FRACTIONAL_TO_USDC,
                 price: PriceArgs {
                     price: 1,
@@ -320,7 +325,6 @@ async fn test_liquidation_doesnt_use_smoothed_price() {
                     fees: ReserveFees::default(),
                     optimal_borrow_rate: 0,
                     max_borrow_rate: 0,
-                    protocol_liquidation_fee: 0,
                     ..test_reserve_config()
                 },
                 liquidity_amount: 100 * LAMPORTS_PER_SOL,
@@ -333,10 +337,10 @@ async fn test_liquidation_doesnt_use_smoothed_price() {
                 },
             },
         ],
-        &ObligationArgs {
+        &[ObligationArgs {
             deposits: vec![(usdc_mint::id(), 100 * FRACTIONAL_TO_USDC)],
             borrows: vec![(wsol_mint::id(), LAMPORTS_PER_SOL)],
-        },
+        }],
     )
     .await;
 
@@ -361,8 +365,8 @@ async fn test_liquidation_doesnt_use_smoothed_price() {
             &mut test,
             &find_reserve(&reserves, &wsol_mint::id()).unwrap(),
             &find_reserve(&reserves, &usdc_mint::id()).unwrap(),
-            &obligation,
-            &user,
+            &obligations[0],
+            &users[0],
             u64::MAX,
         )
         .await
@@ -372,7 +376,7 @@ async fn test_liquidation_doesnt_use_smoothed_price() {
     assert_eq!(
         err,
         TransactionError::InstructionError(
-            3,
+            1,
             InstructionError::Custom(LendingError::ObligationHealthy as u32)
         )
     );
@@ -397,8 +401,8 @@ async fn test_liquidation_doesnt_use_smoothed_price() {
             &mut test,
             &find_reserve(&reserves, &wsol_mint::id()).unwrap(),
             &find_reserve(&reserves, &usdc_mint::id()).unwrap(),
-            &obligation,
-            &user,
+            &obligations[0],
+            &users[0],
             u64::MAX,
         )
         .await
@@ -408,7 +412,7 @@ async fn test_liquidation_doesnt_use_smoothed_price() {
     assert_eq!(
         err,
         TransactionError::InstructionError(
-            3,
+            1,
             InstructionError::Custom(LendingError::ObligationHealthy as u32)
         )
     );
@@ -461,7 +465,7 @@ async fn test_liquidation_doesnt_use_smoothed_price() {
             &mut test,
             &find_reserve(&reserves, &wsol_mint::id()).unwrap(),
             &find_reserve(&reserves, &usdc_mint::id()).unwrap(),
-            &obligation,
+            &obligations[0],
             &liquidator,
             u64::MAX,
         )

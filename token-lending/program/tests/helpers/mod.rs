@@ -14,14 +14,7 @@ use solana_sdk::{
     account::Account,
     signature::{Keypair, Signer},
 };
-use solend_program::{
-    instruction::{
-        borrow_obligation_liquidity, deposit_reserve_liquidity_and_obligation_collateral,
-        init_obligation, liquidate_obligation, refresh_obligation, refresh_reserve,
-        withdraw_obligation_collateral_and_redeem_reserve_collateral,
-    },
-    state::{Obligation, ReserveConfig, ReserveFees},
-};
+use solend_program::state::{ReserveConfig, ReserveFees, ReserveType};
 
 use spl_token::state::Mint;
 
@@ -37,12 +30,16 @@ pub const FRACTIONAL_TO_USDC: u64 = 1_000_000;
 pub fn test_reserve_config() -> ReserveConfig {
     ReserveConfig {
         optimal_utilization_rate: 80,
+        max_utilization_rate: 80,
         loan_to_value_ratio: 50,
-        liquidation_bonus: 5,
+        liquidation_bonus: 4,
+        max_liquidation_bonus: 4,
         liquidation_threshold: 55,
+        max_liquidation_threshold: 65,
         min_borrow_rate: 0,
         optimal_borrow_rate: 4,
         max_borrow_rate: 30,
+        super_max_borrow_rate: 30,
         fees: ReserveFees {
             borrow_fee_wad: 0,
             flash_loan_fee_wad: 0,
@@ -51,9 +48,10 @@ pub fn test_reserve_config() -> ReserveConfig {
         deposit_limit: u64::MAX,
         borrow_limit: u64::MAX,
         fee_receiver: Keypair::new().pubkey(),
-        protocol_liquidation_fee: 0,
+        protocol_liquidation_fee: 10,
         protocol_take_rate: 0,
         added_borrow_weight_bps: 0,
+        reserve_type: ReserveType::Regular,
     }
 }
 
@@ -70,7 +68,11 @@ pub mod wsol_mint {
     solana_program::declare_id!("So1m5eppzgokXLBt9Cg8KCMPWhHfTzVaGh26Y415MRG");
 }
 
-trait AddPacked {
+pub mod bonk_mint {
+    solana_program::declare_id!("bonk99WdRCGrh56xQaeQuRMpMHgiNZEfVoZ53DJAoHS");
+}
+
+pub trait AddPacked {
     fn add_packable_account<T: Pack>(
         &mut self,
         pubkey: Pubkey,
