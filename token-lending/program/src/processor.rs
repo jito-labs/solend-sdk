@@ -2235,12 +2235,8 @@ fn process_update_reserve_config(
             msg!("permissionless markets can't edit fee receiver");
             return Err(LendingError::InvalidConfig.into());
         }
-        if reserve.config.fees.flash_loan_fee_wad != config.fees.flash_loan_fee_wad {
-            msg!("permissionless markets can't edit flash loan fees");
-            return Err(LendingError::InvalidConfig.into());
-        }
-        if reserve.config.fees.host_fee_percentage != config.fees.host_fee_percentage {
-            msg!("permissionless markets can't edit host fee percentage");
+        if reserve.config.fees != config.fees {
+            msg!("permissionless markets can't edit fee configs!");
             return Err(LendingError::InvalidConfig.into());
         }
     }
@@ -2280,8 +2276,7 @@ fn process_update_reserve_config(
             reserve.liquidity.switchboard_oracle_pubkey = *switchboard_feed_info.key;
         }
         if reserve.liquidity.switchboard_oracle_pubkey == solend_program::NULL_PUBKEY
-            && (*pyth_price_info.key == solend_program::NULL_PUBKEY
-                || *pyth_product_info.key == solend_program::NULL_PUBKEY)
+            && reserve.liquidity.pyth_oracle_pubkey == solend_program::NULL_PUBKEY
         {
             msg!("At least one price oracle must have a non-null pubkey");
             return Err(LendingError::InvalidOracleConfig.into());
@@ -2303,6 +2298,14 @@ fn process_update_reserve_config(
         if config.deposit_limit < reserve.config.deposit_limit {
             reserve.config.deposit_limit = config.deposit_limit;
         }
+    } else if *signer_info.key == solend_market_owner::id()
+    // 5ph has the ability to change the
+    // fees on permissionless markets
+    {
+        reserve.config.fees = config.fees;
+        reserve.config.protocol_liquidation_fee = config.protocol_liquidation_fee;
+        reserve.config.protocol_take_rate = config.protocol_take_rate;
+        reserve.config.fee_receiver = config.fee_receiver;
     } else {
         msg!("Signer must be the Lending market owner or risk authority");
         return Err(LendingError::InvalidSigner.into());
