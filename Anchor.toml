@@ -3,7 +3,6 @@ anchor_version = "0.13.2"
 [workspace]
 members = [
     "token-lending/program",
-    "token-lending/brick",
 ]
 
 [provider]
