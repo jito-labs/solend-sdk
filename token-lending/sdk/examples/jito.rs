@@ -63,8 +63,7 @@ pub fn main() {
                     .entry(obligation.owner)
                     .or_insert(Position::default());
 
-                position.borrow_balance +=
-                    borrow.borrowed_amount_wads.try_round_u64().unwrap();
+                position.borrow_balance += borrow.borrowed_amount_wads.try_round_u64().unwrap();
             }
         }
     }

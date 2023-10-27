@@ -1,21 +1,16 @@
 #![allow(missing_docs)]
-use crate::{self as solend_program, error::LendingError};
-use pyth_sdk_solana::Price;
+
 use solana_client::rpc_client::RpcClient;
 use solana_program::slot_history::Slot;
 // use pyth_sdk_solana;
-use solana_program::{
-    account_info::AccountInfo, msg, program_error::ProgramError, sysvar::clock::Clock,
-};
-use std::{convert::TryInto, result::Result};
+use solana_program::program_error::ProgramError;
+use std::result::Result;
 
 use crate::{state::LastUpdate, NULL_PUBKEY};
-use std::time::Duration;
 
 use solana_program::{program_pack::Pack, pubkey::Pubkey};
 
 use crate::math::{Decimal, Rate, TryAdd, TryMul};
-use std::collections::HashSet;
 
 use crate::state::{LendingMarket, Obligation, Reserve};
 use std::{collections::HashMap, error::Error};
